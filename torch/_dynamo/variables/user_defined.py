@@ -1673,13 +1673,16 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 ):
                     # Manually trace out the nn module __getattr__ to avoid large compilation latency.
                     out = self.manually_trace_nn_module_getattr(tx, name)
-                else:
-                    new_source = None
-                    if self.source:
-                        new_source = AttrSource(self.source, "__getattr__")
-                    out = variables.UserMethodVariable(
-                        getattr_fn, self, source=new_source
-                    ).call_function(tx, [ConstantVariable.create(name)], {})
+
+                new_source = None
+                if self.source:
+                    new_source = AttrSource(
+                        AttrSource(self.source, "__getattr__"), "__func__"
+                    )
+                getattr_vt = VariableTracker.build(tx, getattr_fn, source=new_source)
+                out = getattr_vt.call_function(
+                    tx, [self, ConstantVariable.create(name)], {}
+                )
 
                 if self.source and getattr_fn is torch.nn.Module.__getattr__:
                     if isinstance(
