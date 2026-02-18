@@ -444,3 +444,13 @@ def standalone_compile(
     return standalone_compile(
         gm, example_inputs, dynamic_shapes=dynamic_shapes, options=options, aot=aot
     )
+
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class _CudagraphAnnotation:
+    mode: str
+    fwd: bool
+    bwd: bool
