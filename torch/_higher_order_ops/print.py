@@ -26,6 +26,15 @@ class Print(HigherOrderOperator):
        torch._higher_order_ops.print("moo {} {y}", 1, y=2)
        Output: "moo 1 2"
 
+    4. DTensor support:
+       When DTensor args are passed, the full (global) tensor is gathered
+       via all-gather and printed on rank 0 only.
+
+       dtensor = DTensor.from_local(local_shard, device_mesh, [Shard(0)])
+       torch._higher_order_ops.print("activations: {}", dtensor)
+       # Rank 0 prints: "activations: tensor([0., 1., 2., ...])"
+       # Ranks 1-N: no output
+
     This HOP enables printing without causing graph break.
     """
 
@@ -101,6 +110,21 @@ def print_impl(format_str: str, *args: object, **kwargs: object) -> None:
 
 print.fallthrough(torch._C.DispatchKey.AutogradCPU)
 print.fallthrough(torch._C.DispatchKey.AutogradCUDA)
+
+
+def _register_dtensor_impl() -> None:
+    from torch.distributed.tensor import DTensor
+
+    @print.py_impl(DTensor)  # pyrefly: ignore [missing-attribute]
+    # pyre-ignore
+    def print_dtensor(format_str: str, *args: object, **kwargs: object) -> None:
+        import torch.distributed as dist
+
+        # Gather the full (global) tensor from all ranks via all-gather collective
+        local_args = pytree.tree_map_only(DTensor, DTensor.full_tensor, args)
+        local_kwargs = pytree.tree_map_only(DTensor, DTensor.full_tensor, kwargs)
+        if dist.get_rank() == 0:
+            print(format_str, *local_args, **local_kwargs)
 
 
 @print.py_functionalize_impl
