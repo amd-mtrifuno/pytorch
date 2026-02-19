@@ -208,12 +208,14 @@ _distributed_autotune_state: Virtualized[_DistributedAutotuneState] = Virtualize
 )
 
 
-def _active_user_lowering_ops_default() -> set[Any]:
-    """Default factory for active_user_lowering_ops - returns empty set."""
-    return set()
+def _active_user_lowering_ops_default() -> OrderedSet[Any]:
+    """Default factory for active_user_lowering_ops - returns persisted empty set."""
+    rv: OrderedSet[Any] = OrderedSet()
+    setattr(threadlocal, _active_user_lowering_ops._key, rv)
+    return rv
 
 
-_active_user_lowering_ops: Virtualized[set[Any]] = Virtualized(
+_active_user_lowering_ops: Virtualized[OrderedSet[Any]] = Virtualized(
     "active_user_lowering_ops", _active_user_lowering_ops_default
 )
 
@@ -394,7 +396,7 @@ class _V:
     set_active_user_lowering_ops: Callable[[Any], Any] = (
         _active_user_lowering_ops._set_handler
     )
-    get_active_user_lowering_ops: Callable[[], set[Any]] = (
+    get_active_user_lowering_ops: Callable[[], OrderedSet[Any]] = (
         _active_user_lowering_ops._get_handler
     )
 
@@ -461,7 +463,7 @@ class _V:
         return _distributed_autotune_state._get_handler()
 
     @property
-    def active_user_lowering_ops(self) -> set[Any]:
+    def active_user_lowering_ops(self) -> OrderedSet[Any]:
         """Set of ops currently being lowered via user_lowerings (for recursion guard)."""
         return _active_user_lowering_ops._get_handler()
 

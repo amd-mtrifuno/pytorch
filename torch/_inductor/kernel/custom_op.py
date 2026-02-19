@@ -8,8 +8,14 @@ from typing import Any, Optional, Union
 
 import torch
 from torch._inductor.codegen.subgraph import SubgraphTemplate
-from torch._inductor.ir import Buffer, FixedLayout, ir_node_to_tensor, StorageBox, TensorBox
-from torch._inductor.lowering import lowerings, user_lowerings, validate_ir
+from torch._inductor.ir import (
+    Buffer,
+    FixedLayout,
+    ir_node_to_tensor,
+    StorageBox,
+    TensorBox,
+)
+from torch._inductor.lowering import user_lowerings, validate_ir
 from torch._inductor.select_algorithm import (
     autotune_select_algorithm,
     ExternKernelChoice,
@@ -316,8 +322,22 @@ def _group_ranges_by_impl(
     range_to_best_impl: dict[RangeBounds, ImplConfig],
 ) -> list[RangeImplGroup]:
     """Group ranges by implementation using semantic identity (name + kwargs)."""
+    from torch._inductor import config
+
     if not range_to_best_impl:
         return []
+
+    # Test mode: skip grouping to force torch.cond dispatch path
+    if config.test_configs.force_no_impl_grouping:
+        log.info("Test mode: skipping impl grouping, each range is separate group")
+        groups = []
+        for range_bounds, impl_config in sorted(
+            range_to_best_impl.items(), key=lambda x: x[0].start
+        ):
+            group = RangeImplGroup(impl_config)
+            group.add_range(range_bounds)
+            groups.append(group)
+        return groups
 
     # Group ranges by impl_config (uses __hash__ and __eq__ based on semantic identity)
     impl_to_group: dict[ImplConfig, RangeImplGroup] = {}
@@ -521,9 +541,7 @@ def autotune_custom_op(
             fake_output = op_overload(*fake_inputs, **fallback_kwargs)
 
         output_size = tuple(convert_symint_to_expr(s) for s in fake_output.shape)
-        output_stride = tuple(
-            convert_symint_to_expr(s) for s in fake_output.stride()
-        )
+        output_stride = tuple(convert_symint_to_expr(s) for s in fake_output.stride())
 
         fallback_choice = _create_fallback_choice(name, op_overload, fallback_kwargs)
         fallback_choice.maybe_append_choice(
@@ -535,7 +553,7 @@ def autotune_custom_op(
                 size=output_size,
                 stride=output_stride,
             ),
-            )
+        )
 
     if not choices:
         raise RuntimeError(f"No valid choices generated for {name}")
@@ -598,14 +616,13 @@ def autotune_custom_op(
 def _generate_dynamic_configs(
     tensor_inputs: list[Buffer],
     config_generator: Callable[[dict[str, torch.Tensor]], list[CustomOpConfig]],
-    default_impl: Callable[..., Any],
+    op_overload: torch._ops.OpOverload,
     operation_name: str,
 ) -> list[CustomOpConfig]:
     """Generate configs dynamically based on input tensors at lowering time."""
-    import inspect
-
-    sig = inspect.signature(default_impl)
-    param_names = list(sig.parameters.keys())
+    # Get parameter names from op schema instead of impl signature
+    schema = op_overload._schema
+    param_names = [arg.name for arg in schema.arguments if not arg.kwarg_only]
 
     with V.fake_mode:
         fake_tensors = [ir_node_to_tensor(inp) for inp in tensor_inputs]
@@ -636,6 +653,7 @@ def _prepare_configs_and_decompositions(
     ],
     tensor_inputs: list[Any],
     default_impl: Callable[..., Any],
+    op_overload: torch._ops.OpOverload,
     runtime_kwargs: dict[str, Any],
     name: str,
 ) -> tuple[list[Callable], list[dict[str, Any]]]:
@@ -647,7 +665,7 @@ def _prepare_configs_and_decompositions(
     # Get configs: either generate dynamically or use static configs
     if config_generator is not None:
         configs_to_use = _generate_dynamic_configs(
-            tensor_inputs, config_generator, default_impl, name
+            tensor_inputs, config_generator, op_overload, name
         )
     else:
         assert processed_configs is not None
@@ -691,13 +709,16 @@ def _standard_lowering_fn(
     Returns None if no configs/decompositions available, signaling caller to
     use normal lowering.
     """
-    decompositions, non_tensor_args, config_patches_list = _prepare_configs_and_decompositions(
-        processed_configs,
-        config_generator,
-        tensor_inputs,
-        default_impl,
-        runtime_kwargs,
-        name,
+    decompositions, non_tensor_args, config_patches_list = (
+        _prepare_configs_and_decompositions(
+            processed_configs,
+            config_generator,
+            tensor_inputs,
+            default_impl,
+            op_overload,
+            runtime_kwargs,
+            name,
+        )
     )
 
     # If no decompositions, signal caller to use normal lowering
@@ -744,28 +765,70 @@ def _lower_single_impl(
     tensor_inputs: list[Any],
     name: str,
     config_patches: Optional[dict[str, Any]] = None,
+    default_impl: Optional[Callable[..., Any]] = None,
 ) -> Any:
-    """Lower a single implementation by tracing and inlining it."""
+    """Lower a single implementation by tracing and inlining it.
+
+    Uses error_on_new_guards() during tracing to detect if the impl adds guards.
+    If it does and default_impl is provided, falls back to default_impl.
+    """
     from torch._inductor.codegen.subgraph import inline_subgraph_to_ir_nodes
     from torch.fx.experimental.proxy_tensor import make_fx
+    from torch.fx.experimental.symbolic_shapes import ShapeEnvGuardError
 
     from ..decomposition import select_decomp_table
 
     merged_kwargs = _merge_config_and_runtime_kwargs(impl_kwargs, runtime_kwargs)
 
-    def impl_wrapper(*tensors):
-        return impl(*tensors, **merged_kwargs)
+    def make_impl_wrapper(fn):
+        def impl_wrapper(*tensors):
+            return fn(*tensors, **merged_kwargs)
+
+        return impl_wrapper
+
+    shape_env = V.fake_mode.shape_env
 
     with V.fake_mode:
         fake_inputs = tuple(ir_node_to_tensor(inp) for inp in tensor_inputs)
         decomposition_table = select_decomp_table()
-        impl_gm = make_fx(
-            impl_wrapper,
-            decomposition_table=decomposition_table,
-            tracing_mode="symbolic",
-        )(*fake_inputs)
 
-    log.info("Inlining implementation: %s", impl.__name__)
+        # Try tracing with error_on_new_guards; fall back to default_impl if guards are added
+        impl_to_use = impl
+        if shape_env is not None and impl != default_impl and default_impl is not None:
+            try:
+                with shape_env.error_on_new_guards():
+                    impl_gm = make_fx(
+                        make_impl_wrapper(impl),
+                        decomposition_table=decomposition_table,
+                        tracing_mode="symbolic",
+                    )(*fake_inputs)
+            except (ShapeEnvGuardError, AssertionError) as e:
+                # ShapeEnvGuardError may be wrapped in AssertionError by dynamo
+                is_guard_error = isinstance(e, ShapeEnvGuardError) or (
+                    isinstance(e, AssertionError)
+                    and "Guard attempted while ShapeEnv guards are frozen" in str(e)
+                )
+                if not is_guard_error:
+                    raise
+                log.info(
+                    "Implementation %s adds guards, falling back to %s",
+                    impl.__name__,
+                    default_impl.__name__,
+                )
+                impl_to_use = default_impl
+                impl_gm = make_fx(
+                    make_impl_wrapper(default_impl),
+                    decomposition_table=decomposition_table,
+                    tracing_mode="symbolic",
+                )(*fake_inputs)
+        else:
+            impl_gm = make_fx(
+                make_impl_wrapper(impl),
+                decomposition_table=decomposition_table,
+                tracing_mode="symbolic",
+            )(*fake_inputs)
+
+    log.info("Inlining implementation: %s", impl_to_use.__name__)
     ops_before = len(V.graph.operations)
     result = inline_subgraph_to_ir_nodes(impl_gm, tensor_inputs, name)
 
@@ -803,13 +866,16 @@ def _range_based_lowering_fn(
     log.info("=== Range-based Autotuning for %s ===", name)
     log.info("Dispatch on: %s[%d], Ranges: %s", tensor_name, dim_index, ranges)
 
-    decompositions, non_tensor_args, config_patches_list = _prepare_configs_and_decompositions(
-        processed_configs,
-        config_generator,
-        tensor_inputs,
-        default_impl,
-        runtime_kwargs,
-        name,
+    decompositions, non_tensor_args, config_patches_list = (
+        _prepare_configs_and_decompositions(
+            processed_configs,
+            config_generator,
+            tensor_inputs,
+            default_impl,
+            op_overload,
+            runtime_kwargs,
+            name,
+        )
     )
 
     range_to_best_impl_map: dict[RangeBounds, ImplConfig] = {}
@@ -876,7 +942,68 @@ def _range_based_lowering_fn(
             impl_config.impl_name,
         )
 
-    # Group ranges by implementation (more aggressive than adjacent merging)
+    # Group ranges by implementation and trace dispatch function
+    from torch.fx.experimental.symbolic_shapes import ShapeEnvGuardError
+
+    def build_dispatch_fn(groups):
+        """Build dispatch function for the given impl groups."""
+
+        def dispatch_fn(*fake_tensors):
+            num_impl_groups = len(groups)
+            if num_impl_groups < 2:
+                raise RuntimeError(
+                    f"dispatch_fn requires at least 2 impl groups, got {num_impl_groups}"
+                )
+
+            dim_value = fake_tensors[0].size(dim_index)
+
+            def build_range_predicate(ranges_list: list[RangeBounds]) -> torch.Tensor:
+                predicates = []
+                for rb in ranges_list:
+                    end = int(rb.end) if rb.end != float("inf") else None
+                    if end is None:
+                        predicates.append(dim_value >= rb.start)
+                    else:
+                        predicates.append((dim_value >= rb.start) & (dim_value <= end))
+
+                result = predicates[0]
+                for pred in predicates[1:]:
+                    result = result | pred
+                return result  # pyrefly: ignore [bad-return]
+
+            def build_nested_cond(idx: int):
+                if idx >= num_impl_groups:
+                    raise RuntimeError(f"Invalid impl group index: {idx}")
+
+                group = groups[idx]
+                merged_kwargs = _merge_config_and_runtime_kwargs(
+                    group.impl_kwargs, runtime_kwargs
+                )
+
+                @torch._dynamo.dont_skip_tracing
+                def group_fn(*ops):
+                    return group.impl_func(*ops, **merged_kwargs)
+
+                if idx == num_impl_groups - 1:
+                    return group_fn
+
+                next_fn = build_nested_cond(idx + 1)
+
+                @torch._dynamo.dont_skip_tracing
+                def cond_wrapper(*ops, _ranges=group.ranges):
+                    return torch.cond(
+                        pred=build_range_predicate(_ranges),
+                        true_fn=group_fn,
+                        false_fn=next_fn,
+                        operands=ops,
+                    )
+
+                return cond_wrapper
+
+            return build_nested_cond(0)(*fake_tensors)
+
+        return dispatch_fn
+
     impl_groups = _group_ranges_by_impl(range_to_best_impl_map)
 
     log.info("After grouping by implementation: %d impl groups", len(impl_groups))
@@ -888,83 +1015,59 @@ def _range_based_lowering_fn(
         group = impl_groups[0]
         log.info("Only one implementation after grouping, directly inlining")
         return _lower_single_impl(
-            group.impl_func, group.impl_kwargs, runtime_kwargs, tensor_inputs, name,
+            group.impl_func,
+            group.impl_kwargs,
+            runtime_kwargs,
+            tensor_inputs,
+            name,
             config_patches=group.config_patches,
+            default_impl=default_impl,
         )
 
-    def dispatch_fn(*fake_tensors):
-        """Build nested torch.cond dispatch: cond(pred1, impl1, cond(pred2, impl2, ...))."""
-        num_impl_groups = len(impl_groups)
-        if num_impl_groups < 2:
-            raise RuntimeError(
-                f"dispatch_fn requires at least 2 impl groups, got {num_impl_groups}"
-            )
+    dispatch_fn = build_dispatch_fn(impl_groups)
 
-        dim_value = fake_tensors[0].size(dim_index)
-
-        def build_range_predicate(ranges_list: list[RangeBounds]) -> torch.Tensor:
-            """Build OR predicate: (dim in range1) | (dim in range2) | ..."""
-            predicates = []
-            for rb in ranges_list:
-                end = int(rb.end) if rb.end != float("inf") else None
-                if end is None:
-                    predicates.append(dim_value >= rb.start)
-                else:
-                    predicates.append((dim_value >= rb.start) & (dim_value <= end))
-
-            result = predicates[0]
-            for pred in predicates[1:]:
-                result = result | pred
-            return result  # pyrefly: ignore [bad-return]
-
-        def build_nested_cond(idx: int):
-            """Recursively build nested torch.cond for impl_groups[idx:]."""
-            if idx >= num_impl_groups:
-                raise RuntimeError(f"Invalid impl group index: {idx}")
-
-            group = impl_groups[idx]
-            merged_kwargs = _merge_config_and_runtime_kwargs(
-                group.impl_kwargs, runtime_kwargs
-            )
-
-            @torch._dynamo.dont_skip_tracing
-            def group_fn(*ops):
-                return group.impl_func(*ops, **merged_kwargs)
-
-            if idx == num_impl_groups - 1:
-                return group_fn
-
-            next_fn = build_nested_cond(idx + 1)
-
-            @torch._dynamo.dont_skip_tracing
-            def cond_wrapper(*ops, _ranges=group.ranges):
-                return torch.cond(
-                    pred=build_range_predicate(_ranges),
-                    true_fn=group_fn,
-                    false_fn=next_fn,
-                    operands=ops,
-                )
-
-            return cond_wrapper
-
-        return build_nested_cond(0)(*fake_tensors)
-
-    # Trace with make_fx using fake mode
     with V.fake_mode:
         fake_inputs = tuple(ir_node_to_tensor(inp) for inp in tensor_inputs)
         decomposition_table = select_decomp_table()
+        shape_env = V.fake_mode.shape_env
 
         log.info("Tracing torch.cond dispatch with symbolic shapes...")
 
         try:
-            dispatch_gm = make_fx(
-                dispatch_fn,
-                decomposition_table=decomposition_table,
-                tracing_mode="symbolic",
-            )(*fake_inputs)
+            if shape_env is not None:
+                with shape_env.error_on_new_guards():
+                    dispatch_gm = make_fx(
+                        dispatch_fn,
+                        decomposition_table=decomposition_table,
+                        tracing_mode="symbolic",
+                    )(*fake_inputs)
+            else:
+                dispatch_gm = make_fx(
+                    dispatch_fn,
+                    decomposition_table=decomposition_table,
+                    tracing_mode="symbolic",
+                )(*fake_inputs)
 
             log.info("Successfully traced torch.cond dispatch")
             log.info("Traced graph:\n%s", dispatch_gm.graph)
+
+        except (ShapeEnvGuardError, AssertionError) as e:
+            # ShapeEnvGuardError may be wrapped in AssertionError by dynamo
+            is_guard_error = isinstance(e, ShapeEnvGuardError) or (
+                isinstance(e, AssertionError)
+                and "Guard attempted while ShapeEnv guards are frozen" in str(e)
+            )
+            if not is_guard_error:
+                raise
+            log.info("Dispatch function adds guards, falling back to default_impl")
+            return _lower_single_impl(
+                default_impl,
+                {},
+                runtime_kwargs,
+                tensor_inputs,
+                name,
+                default_impl=default_impl,
+            )
 
         except Exception:
             log.exception("make_fx tracing FAILED")
@@ -1155,20 +1258,19 @@ def register_custom_op_autotuning(
     from torch._library.custom_ops import CustomOpDef
 
     # Handle both CustomOpDef and OpOverload - derive impl_fn automatically
+    # Both cases call through op_overload so fake handlers are used during tracing
     if isinstance(custom_op, CustomOpDef):
         op_overload = custom_op._opoverload
-        impl_fn = custom_op._init_fn
     elif isinstance(custom_op, torch._ops.OpOverload):
         op_overload = custom_op
-        # For OpOverload, the default impl just calls the op itself.
-        # When traced, this creates the op call that falls through to
-        # normal Inductor lowerings (via V.active_user_lowering_ops guard).
-        def impl_fn(*args, **kwargs):
-            return op_overload(*args, **kwargs)
     else:
         raise TypeError(
             f"custom_op must be a CustomOpDef or OpOverload, got {type(custom_op)}."
         )
+
+    # impl_fn calls through op_overload so fake handlers are used during tracing
+    def impl_fn(*args, **kwargs):
+        return op_overload(*args, **kwargs)
 
     # Validate configs and config_generator are mutually exclusive
     if configs is not None and config_generator is not None:
